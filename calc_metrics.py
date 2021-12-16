@@ -93,6 +93,10 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--gpus', help='Number of GPUs to use', type=int, default=1, metavar='INT', show_default=True)
 @click.option('--verbose', help='Print optional information', type=bool, default=True, metavar='BOOL', show_default=True)
 
+# python calc_metrics.py --metrics=fid50k_full,kid50k_full,pr50k3_full --data=/data/syed/TMA_1024_Arteriole_train
+#   --mirror=1 --gpus 4 --network=/data/syed/stylegan2-ada-training/00000--mirror-auto4/network-snapshot-003000.pkl
+#   > /data/syed/stylegan2-ada-training/00000--mirror-auto4/network_snapshot_eval/network-snapshot-003000.txt
+
 def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose):
     """Calculate quality metrics for previous training run or pretrained network pickle.
 

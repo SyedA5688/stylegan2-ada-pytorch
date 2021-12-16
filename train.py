@@ -22,6 +22,14 @@ from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+#  /home/cougarnet.uh.edu/srizvi7/anaconda3/envs/stylegan2_ada/bin/python train.py --outdir=/data/syed/stylegan2-ada-training/ --data=/data/public/HULA/TMA/tile
+#       --gpus=4 --mirror=1 --onlineprocessing=1
+#  /home/cougarnet.uh.edu/srizvi7/anaconda3/envs/stylegan2_ada/bin/python train.py --outdir=/data/syed/stylegan2-ada-training/ --data=/data/public/HULA/TMA/tile
+#       --gpus=4 --mirror=1 --onlineprocessing=1 --augpipe color --resume=/data/syed/stylegan2-ada-training/00001-tile-mirror-auto4/network-snapshot-000400.pkl
+#  /home/cougarnet.uh.edu/srizvi7/anaconda3/envs/stylegan2_ada/bin/python train.py --outdir=/data/syed/stylegan2-ada-training/ --data=/data/syed/TMA_2048_Glomerulus/ --gpus=4 --mirror=1
+#  /home/cougarnet.uh.edu/srizvi7/anaconda3/envs/stylegan2_ada/bin/python train.py --outdir=/data/syed/stylegan2-ada-training/ --data=/data/syed/TMA_1024_Arteriole/ --gpus=4 --mirror=1
+
 #----------------------------------------------------------------------------
 
 class UserError(Exception):
@@ -41,6 +49,7 @@ def setup_training_loop_kwargs(
     cond       = None, # Train conditional model based on dataset labels: <bool>, default = False
     subset     = None, # Train with only N images: <int>, default = all
     mirror     = None, # Augment dataset with x-flips: <bool>, default = False
+    onlineprocessing = None, # Process and resize data during training rather than saving resized version beforehand
 
     # Base config.
     cfg        = None, # Base config: 'auto' (default), 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar'
@@ -104,7 +113,10 @@ def setup_training_loop_kwargs(
 
     assert data is not None
     assert isinstance(data, str)
-    args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
+    if onlineprocessing:
+        args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderOnlineProcessingDataset', path=data, use_labels=True, max_size=None, xflip=False)
+    else:
+        args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
     args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
     try:
         training_set = dnnlib.util.construct_class_by_name(**args.training_set_kwargs) # subclass of training.dataset.Dataset
@@ -151,8 +163,8 @@ def setup_training_loop_kwargs(
     assert isinstance(cfg, str)
     desc += f'-{cfg}'
 
-    cfg_specs = {
-        'auto':      dict(ref_gpus=-1, kimg=25000,  mb=-1, mbstd=-1, fmaps=-1,  lrate=-1,     gamma=-1,   ema=-1,  ramp=0.05, map=2), # Populated dynamically based on resolution and GPU count.
+    cfg_specs = {  # Changed map of auto config to 8
+        'auto':      dict(ref_gpus=-1, kimg=25000,  mb=-1, mbstd=-1, fmaps=-1,  lrate=-1,     gamma=-1,   ema=-1,  ramp=0.05, map=8), # Populated dynamically based on resolution and GPU count.
         'stylegan2': dict(ref_gpus=8,  kimg=25000,  mb=32, mbstd=4,  fmaps=1,   lrate=0.002,  gamma=10,   ema=10,  ramp=None, map=8), # Uses mixed-precision, unlike the original StyleGAN2.
         'paper256':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=0.5, lrate=0.0025, gamma=1,    ema=20,  ramp=None, map=8),
         'paper512':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=1,   lrate=0.0025, gamma=0.5,  ema=20,  ramp=None, map=8),
@@ -166,7 +178,11 @@ def setup_training_loop_kwargs(
         desc += f'{gpus:d}'
         spec.ref_gpus = gpus
         res = args.training_set_kwargs.resolution
-        spec.mb = max(min(gpus * min(4096 // res, 32), 64), gpus) # keep gpu memory consumption at bay
+        print('****' * 40, "Resolution is", str(res))
+        # spec.mb = max(min(gpus * min(4096 // res, 32), 64), gpus) # keep gpu memory consumption at bay
+        # 4 GPUs: max(min(4 * min(1, 32), 64), 4) = max(min(4, 64), 4) = max(4, 4) = 4 for 4 gpus - error
+        spec.mb = max(min(gpus * min(8192 // res, 32), 64), gpus) # keep gpu memory consumption at bay
+        # 4 GPUs: max(min(4 * min(2, 32), 64), 4) = max(min(8, 64), 4) = max(8, 4) = 8 for 4 gpus
         spec.mbstd = min(spec.mb // gpus, 4) # other hyperparams behave more predictably if mbstd group size remains fixed
         spec.fmaps = 1 if res >= 512 else 0.5
         spec.lrate = 0.002 if res >= 1024 else 0.0025
@@ -411,6 +427,7 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--cond', help='Train conditional model based on dataset labels [default: false]', type=bool, metavar='BOOL')
 @click.option('--subset', help='Train with only N images [default: all]', type=int, metavar='INT')
 @click.option('--mirror', help='Enable dataset x-flips [default: false]', type=bool, metavar='BOOL')
+@click.option('--onlineprocessing', help='Process dataset online rather than creating copy beforehand offline [default: false]', type=bool, metavar='BOOL')
 
 # Base config.
 @click.option('--cfg', help='Base config [default: auto]', type=click.Choice(['auto', 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar']))

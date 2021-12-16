@@ -234,3 +234,131 @@ class ImageFolderDataset(Dataset):
         return labels
 
 #----------------------------------------------------------------------------
+
+class ImageFolderOnlineProcessingDataset(Dataset):
+    def __init__(self,
+        path,                   # Path to directory or zip.
+        resolution      = None, # Ensure specific resolution, None = highest available.
+        **super_kwargs,         # Additional arguments for the Dataset base class.
+    ):
+        self._path = path
+        self._zipfile = None
+
+        if os.path.isdir(self._path):
+            self._type = 'dir'
+            self._all_fnames = os.listdir(self._path)
+        else:
+            raise IOError('Path must point to a directory')
+
+        PIL.Image.init()
+        # self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in PIL.Image.EXTENSION)
+
+        # ToDo: filter out tiles with no annotations in central 2048x2048 square for TMA tiles, and filter out tiles with
+        #  less than 5% annotations, for example. Create npz file containing array of 1s and 0s to filter out or not, load
+        #  npz file here and filter out in this dataset __init__
+        # ToDo: pass parameters rather than hardcoding validation fold 0 and path to folds
+        # Filtering out WSI tiles that are not a part of the cases in training folds 1-4
+        # Assuming that filenames in folds are correct filenames. Checking in code would be O(n^2) time complexity on nearly 100,000 filenames
+        val_fold = 0
+        training_folds = [0, 1, 2, 3, 4]
+        training_folds.remove(val_fold)
+
+        self._image_fnames = []
+        for fold_idx in training_folds:
+            tma_fold_npz = np.load('/data/public/HULA/folds/TMA_all/TMA_FOLD_{}.npz'.format(fold_idx), allow_pickle=True)
+            for case_idx in range(len(tma_fold_npz['WSI_TILE'])):  # 1 to 10
+                self._image_fnames += [file for file in tma_fold_npz['WSI_TILE'][case_idx]]
+
+        # print("There are", len(self._image_fnames), "filenames loaded from training folds 1 - 4")
+
+        if len(self._image_fnames) == 0:
+            raise IOError('No image files found in the specified path')
+
+        # Square image, dimensions that are power of two assertion
+        example_img = self._load_raw_image(0)
+        assert example_img.shape[1] == example_img.shape[2], "ImageFolderOnlineProcessingDataset assumes that images must be square, please implement resizing for non-square images"
+        assert example_img.shape[1] == 2 ** int(np.floor(np.log2(example_img.shape[1]))), "ImageFolderOnlineProcessingDataset assumes that image dimension (height and width) are powers of two"
+
+        name = os.path.splitext(os.path.basename(self._path))[0]
+        raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
+        if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
+            raise IOError('Image files do not match the specified resolution')
+        super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
+
+    @staticmethod
+    def _file_ext(fname):
+        return os.path.splitext(fname)[1].lower()
+
+    def _get_zipfile(self):
+        assert self._type == 'zip'
+        if self._zipfile is None:
+            self._zipfile = zipfile.ZipFile(self._path)
+        return self._zipfile
+
+    def _open_file(self, fname):
+        if self._type == 'dir':
+            return open(os.path.join(self._path, fname), 'rb')
+        if self._type == 'zip':
+            return self._get_zipfile().open(fname, 'r')
+        return None
+
+    def close(self):
+        try:
+            if self._zipfile is not None:
+                self._zipfile.close()
+        finally:
+            self._zipfile = None
+
+    def __getstate__(self):
+        return dict(super().__getstate__(), _zipfile=None)
+
+    def _load_raw_image(self, raw_idx):
+        fname = self._image_fnames[raw_idx]
+        with self._open_file(fname) as f:
+            if pyspng is not None and self._file_ext(fname) == '.png':
+                image = pyspng.load(f.read())
+            else:
+                image = np.array(PIL.Image.open(f))
+        if image.ndim == 2:
+            image = image[:, :, np.newaxis] # HW => HWC
+        image = image.transpose(2, 0, 1) # HWC => CHW
+        return image
+
+    def _load_raw_labels(self):
+        fname = 'dataset.json'
+        if fname not in self._all_fnames:
+            return None
+        with self._open_file(fname) as f:
+            labels = json.load(f)['labels']
+        if labels is None:
+            return None
+        labels = dict(labels)
+        labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
+        labels = np.array(labels)
+        labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+        return labels
+
+
+if __name__ == "__main__":
+    # online_processing_dataloader = ImageFolderOnlineProcessingDataset(path='/data/public/HULA/TMA/tile/', resolution=4096)
+    training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderOnlineProcessingDataset', path='/data/public/HULA/TMA/tile', use_labels=False, max_size=None, xflip=False, resolution=4096)
+    # training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path='/data/syed/TMA_1024_Arteriole/val_fold_0', use_labels=False, max_size=None, xflip=False, resolution=4096)
+    training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs)
+    print("Dataset size:", len(training_set))
+
+""" Debugging help
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+
+train_loader = DataLoader(training_set, batch_size=8, shuffle=False)
+train_loader_iter = iter(train_loader)
+
+def plot_img(torch_img):
+    img_np = np.array(torch_img)
+    img_np = np.moveaxis(img_np, 0, -1)
+    plt.imshow(img_np)
+    plt.show()
+
+img, label = train_loader_iter.__next__()
+plot_img(img[0])
+"""

@@ -55,13 +55,26 @@ def is_image_ext(fname: Union[str, Path]) -> bool:
 #----------------------------------------------------------------------------
 
 
-def open_image_folder(source_dir, *, max_images: Optional[int]):
+def open_image_folder(source_dir, *, max_images: Optional[int], compartment: str, val_fold: Optional[int]):
+    assert(compartment in ['Glomerulus', 'Arteriole', 'Artery']), "Invalid compartment name specified"
     input_images = [str(f) for f in sorted(Path(source_dir).rglob('*')) if is_image_ext(f) and os.path.isfile(f)]
 
-    # ToDo: Remote following lines for datasets other than TMA
-    # Removing any TMA crops that are not of arteries, arterioles, or glomeruli
+    # ToDo: Note: Following lines are for TMA dataset management
+    # Retrieving filenames from TMA fold npz files.
+    compartment_name_to_npz_abbreviation = { 'Glomerulus': 'GLOM', 'Arteriole': 'ARTERIOLE', 'Artery': 'ARTERY' }
+    abbrev = compartment_name_to_npz_abbreviation[compartment]
+    training_folds = [0, 1, 2, 3, 4]
+    training_folds.remove(val_fold)
 
-    for i in range(1,5):
+    all_training_fold_filenames = []
+    for fold_idx in training_folds:
+        tma_fold_npz = np.load('/data/public/HULA/folds/TMA_all/TMA_FOLD_{}.npz'.format(fold_idx), allow_pickle=True)
+        for case_idx in range(len(tma_fold_npz[abbrev])):
+          all_training_fold_filenames += [''.join(file.split('-multi')) for file in tma_fold_npz[abbrev][case_idx]]
+
+    # Update input_images
+    input_images = [f for f in input_images if str(f).split('/')[-1] in all_training_fold_filenames]
+    print("Length of input images after limiting to what is in training folds is:", len(input_images))
 
     # Load labels.
     labels = {}
@@ -81,7 +94,7 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
             arch_fname = os.path.relpath(fname, source_dir)
             arch_fname = arch_fname.replace('\\', '/')
             img = np.array(Image.open(fname))
-            yield dict(img=img, label=labels.get(arch_fname))
+            yield dict(img=img, label=labels.get(arch_fname), orig_img_name=fname.split('/')[-1])
             if idx >= max_idx-1:
                 break
     return max_idx, iterate_images()
@@ -261,12 +274,12 @@ def make_transform(
 
 #----------------------------------------------------------------------------
 
-def open_dataset(source, *, max_images: Optional[int]):
+def open_dataset(source, *, max_images: Optional[int], compartment: str, val_fold: Optional[int]):
     if os.path.isdir(source):
         if source.rstrip('/').endswith('_lmdb'):
             return open_lmdb(source, max_images=max_images)
         else:
-            return open_image_folder(source, max_images=max_images)
+            return open_image_folder(source, max_images=max_images, compartment=compartment, val_fold=val_fold)
     elif os.path.isfile(source):
         if os.path.basename(source) == 'cifar-10-python.tar.gz':
             return open_cifar10(source, max_images=max_images)
@@ -317,6 +330,8 @@ def open_dest(dest: str) -> Tuple[str, Callable[[str, Union[bytes, str]], None],
 @click.pass_context
 @click.option('--source', help='Directory or archive name for input dataset', required=True, metavar='PATH')
 @click.option('--dest', help='Output directory or archive name for output dataset', required=True, metavar='PATH')
+@click.option('--compartment', help='TMA compartment (Glomerulus, Arteriole, Artery)', required=True)
+@click.option('--val-fold', help='TMA fold used for validation, not included in training dataset', type=int, default=0)
 @click.option('--max-images', help='Output only up to `max-images` images', type=int, default=None)
 @click.option('--resize-filter', help='Filter to use when resizing images for output resolution', type=click.Choice(['box', 'lanczos']), default='lanczos', show_default=True)
 @click.option('--transform', help='Input crop/resize mode', type=click.Choice(['center-crop', 'center-crop-wide']))
@@ -326,6 +341,8 @@ def convert_dataset(
     ctx: click.Context,
     source: str,
     dest: str,
+    compartment: str,
+    val_fold: Optional[int],
     max_images: Optional[int],
     transform: Optional[str],
     resize_filter: str,
@@ -391,7 +408,8 @@ def convert_dataset(
         --transform=center-crop-wide --width 512 --height=384
 
     TMA Dataset Arterioles:
-    python dataset_tool.py --source /data/public/HULA/TMA/img/ --dest /data/syed/TMA_1024_Arteriole_2/ --transform center-crop --width 1024 --height 1024
+    python tma_dataset_tool.py --source /data/public/HULA/TMA/img/ --dest /data/syed/TMA_2048_Glomerulus_train/ --transform center-crop --width 2048 --height 2048 --compartment Glomerulus
+    python tma_dataset_tool.py --source /data/public/HULA/TMA/img/ --dest /data/syed/TMA_1024_Arteriole_train/ --transform center-crop --width 1024 --height 1024 --compartment Arteriole
     """
 
     Image.init() # type: ignore
@@ -399,7 +417,7 @@ def convert_dataset(
     if dest == '':
         ctx.fail('--dest output filename or directory must not be an empty string')
 
-    num_files, input_iter = open_dataset(source, max_images=max_images)
+    num_files, input_iter = open_dataset(source, max_images=max_images, compartment=compartment, val_fold=val_fold)
     archive_root_dir, save_bytes, close_dest = open_dest(dest)
 
     transform_image = make_transform(transform, width, height, resize_filter)
@@ -409,7 +427,10 @@ def convert_dataset(
     labels = []
     for idx, image in tqdm(enumerate(input_iter), total=num_files):
         idx_str = f'{idx:08d}'
-        archive_fname = f'{idx_str[:5]}/img{idx_str}.png'
+        # archive_fname = f'{idx_str[:5]}/img{idx_str}.png'
+        archive_fname = f'{idx_str[:5]}/' + image['orig_img_name']
+
+        # To save image name correctly: ''.join(file.split('-multi'))
 
         # Apply crop and resize.
         img = transform_image(image['img'])
